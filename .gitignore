@@ -1,0 +1,7 @@
+# Data
+depthMaps/
+Raw/
+*.zip
+
+# System
+.DS_Store
