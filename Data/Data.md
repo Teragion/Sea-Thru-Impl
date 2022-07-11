@@ -1,0 +1,1 @@
+Depth maps and images are stored in separate folders as `xxxx/depthMaps/` and `xxxx/Raw/`.
