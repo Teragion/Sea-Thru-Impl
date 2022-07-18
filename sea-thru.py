@@ -16,6 +16,7 @@
 # 
 
 import argparse
+import queue
 
 import numpy as np
 import math
@@ -84,7 +85,7 @@ def find_reference_points(image, depths, frac=0.01):
             ret.append(points_sorted[j])
     return np.asarray(ret)
 
-def estimate_channel_backscatter(points, channel, attempts = 50):
+def estimate_channel_backscatter(points, depths, channel, attempts = 50):
 
     lo = np.array([0, 0, 0, 0])
     hi = np.array([1, 5, 1, 5])
@@ -102,17 +103,171 @@ def estimate_channel_backscatter(points, channel, attempts = 50):
 
     print("Found coeffs for channel {channel} with mse {mse}".format(channel = channel, mse = best_loss))
     print("Veil = {Veil}, backscatter = {backscatter}, recover = {recover}, attenuation = {attenuation}".format(
-        Veil = popt[0], backscatter = popt[1], recover = popt[2], attenuation = popt[3]))
+        Veil = best_coeffs[0], backscatter = best_coeffs[1], recover = best_coeffs[2], attenuation = best_coeffs[3]))
 
-    return best_coeffs
+    Bc_channel = predict_backscatter(depths, *best_coeffs)
+
+    return Bc_channel
 
 def estimate_backscatter(image, depths):
     points = find_reference_points(image, depths)
-    backscatter_coeffs = []
+    backscatter_channels = []
     for channel in range(3):
-        backscatter_coeffs.append(estimate_channel_backscatter(points, channel))
+        backscatter_channels.append(estimate_channel_backscatter(points, depths, channel))
 
-    return backscatter_coeffs
+    Bc = np.stack(backscatter_channels, axis = 2)
+
+    return Bc
+
+# Wideband attenuation
+
+def predict_wideband_attenuation(depths, a, b, c, d):
+    return a * np.exp(b * depths) + c * np.exp(d * depths)
+
+def predict_z(Ec, depths, a, b, c, d):
+    return -np.log(Ec) / (a * np.exp(b * depths) + c * np.exp(d * depths))
+
+def estimate_wideband_attenuation(D, depths):
+    """
+    Args:
+        Dc: direct signal
+    """
+    Ea = compute_illuminant_map(D, depths)
+
+    att_channels = []
+
+    for channel in range(3):
+        att_channels.append(refine_attenuation_estimation(Ea[:, :, channel], depths, channel))
+    
+    att = np.stack(att_channels, axis = 2)
+    
+    return att
+
+def refine_attenuation_estimation(Ec, depths, channel, attempts = 10):
+    """
+    Ec is illuminant map of only 1 channel
+    """
+    # Curve fitting
+    lo = np.array([-5, -10, 0, -10])
+    hi = np.array([50, 1, 50, 1])
+
+    best_loss = np.inf
+    best_coeffs = []
+
+    for _ in range(attempts):
+        popt, pcov = scipy.optimize.curve_fit(lambda Ec, a, b, c, d: predict_z(Ec, depths, a, b, c, d),
+                                              Ec, depths, 
+                                              np.random.random(4) * (hi - lo) + lo, bounds = (lo, hi))
+        cur_loss = np.square(predict_z(Ec, depths, *popt) - depths)
+        if cur_loss < best_loss:
+            best_loss = cur_loss
+            best_coeffs = popt
+
+    print("Found coeffs for channel {channel} with mse {mse}".format(channel = channel, mse = best_loss))
+    print("a = {a}, b = {b}, c = {c}, d = {d}".format(
+        a = best_coeffs[0], b = best_coeffs[1], c = best_coeffs[2], d = best_coeffs[3]))
+
+    att_channel = predict_wideband_attenuation(depths, *best_coeffs)
+
+    return att_channel
+
+def compute_illuminant_map(Dc, depths, iterations = 100, p = 0.7, f = 2, eps = 0.01):
+    neighborhood_maps = compute_neighborhood(depths)
+
+    ac = np.zeros_like(Dc)
+    ac_p = ac.copy()
+    ac_new = ac.copy()
+
+    xlim, ylim, _ = Dc.shape
+
+    for _ in range(iterations):
+        for x in range(xlim):
+            for y in range(ylim):
+                idcs = neighborhood_maps[x][y]
+                ac_p[x, y] = np.sum(ac[idcs]) / len(idcs)
+        ac_new = Dc * p + ac_p * (1 - p)
+        if np.max(np.abs(ac - ac_new)) < eps:
+            break
+        ac = ac_new
+
+    return ac * f
+
+def compute_neighborhood(depths, epsilon = 0.03):
+    """
+    This could be very expensive...
+    """
+    flags = np.zeros_like(depths, dtype = np.intc)
+    
+    xlim, ylim = depths.shape
+
+    neighborhood_maps = []
+    for x in range(xlim):
+        row = []
+        for y in range(ylim):
+            row.append(find_neighborhood(depths, x, y))
+        neighborhood_maps.append(row)
+
+def find_neighborhood(depths, x, y, epsilon):
+    flags = np.zeros_like(depths, dtype = np.intc)
+    xlim, ylim = depths.shape
+
+    z = depths.copy()
+    z = np.abs(z - z[x, y])
+
+    q = queue.Queue()
+    q.put((x, y))
+
+    ret = []
+
+    while q.not_empty():
+        cur_x, cur_y = q.get()
+        if flags[cur_x, cur_y]:
+            continue
+        if z[cur_x, cur_y] < epsilon:
+            ret.append((cur_x, cur_y))
+            flags[cur_x, cur_y] = 1
+            if cur_x > 0:
+                q.put((cur_x - 1, cur_y))
+            if cur_y > 0:
+                q.put((cur_x, cur_y - 1))
+            if cur_x < xlim - 1: 
+                q.put((cur_x + 1, cur_y))
+            if cur_y < ylim - 1:
+                q.put((cur_x, cur_y + 1))
+
+    return ret
+
+# Whitebalance
+
+# Whitebalancing with 
+# Conversion functions courtesy of https://stackoverflow.com/a/34913974/2721685
+def rgb2ycbcr(im):
+    xform = np.array([[.299, .587, .114], [-.1687, -.3313, .5], [.5, -.4187, -.0813]])
+    ycbcr = im.dot(xform.T)
+    ycbcr[:, :, [1,2]] += 128
+    return ycbcr #np.uint8(ycbcr)
+
+def ycbcr2rgb(im):
+    xform = np.array([[1, 0, 1.402], [1, -0.34414, -.71414], [1, 1.772, 0]])
+    rgb = im.astype(np.float)
+    rgb[:, :, [1,2]] -= 128
+    rgb = rgb.dot(xform.T)
+    np.putmask(rgb, rgb > 255, 255)
+    np.putmask(rgb, rgb < 0, 0)
+    return np.uint8(rgb)
+
+def wb_ycbcr_mean(data):
+    # Convert data and sample to YCbCr
+    ycbcr = rgb2ycbcr(data)
+
+    # Calculate mean components
+    yc = list(np.mean(ycbcr[:, :, i]) for i in range(3))
+
+    # Center cb and cr components of image based on sample
+    for i in range(1,3):
+        ycbcr[:, :, i] = np.clip(ycbcr[:, :, i] + (128 - yc[i]), 0, 255)
+    
+    return ycbcr2rgb(ycbcr)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -131,4 +286,12 @@ if __name__ == '__main__':
     else:
         # Predicting depth using monodepth2
         print("Predicting depth using monodepth2")
+
+    Ba = estimate_backscatter(original, depths)
+
+    Da = original - Ba
+
+    att = estimate_wideband_attenuation(Da, depths)
+
+    Ja = Da * np.exp(att)
 
