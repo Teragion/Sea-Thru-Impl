@@ -43,9 +43,9 @@ def read_image(image_path, max_side = 1024):
     image_file.thumbnail((max_side, max_side), Image.ANTIALIAS)
     return np.float32(image_file)
 
-def read_depthmap(depthmap_path, max_side = 1024):
+def read_depthmap(depthmap_path, size):
     depth_file = Image.open(depthmap_path)
-    depth_file.thumbnail((max_side, max_side), Image.ANTIALIAS)
+    depth_file.resize(size, Image.ANTIALIAS)
     return np.array(depth_file)
 
 # Preprocessing
@@ -79,9 +79,11 @@ def find_reference_points(image, depths, frac=0.01):
     for i in range(NUM_BINS):
         lo, hi = z_bins[i], z_bins[i + 1]
         indices = np.where(np.logical_and(depths >= lo, depths < hi))
+        if indices[0].size == 0:
+            continue
         bin_rgb_norm, bin_z, bin_color = rgb_norm[indices], depths[indices], image[indices]
         points_sorted = sorted(zip(bin_rgb_norm, bin_z, bin_color[0], bin_color[1], bin_color[2]), key = lambda p : p[0])
-        for j in range(len(points_sorted) * frac):
+        for j in range(math.ceil(len(points_sorted) * frac)):
             ret.append(points_sorted[j])
     return np.asarray(ret)
 
@@ -96,7 +98,7 @@ def estimate_channel_backscatter(points, depths, channel, attempts = 50):
     for _ in range(attempts):
         popt, pcov = scipy.optimize.curve_fit(predict_backscatter, points[:, 1], points[:, channel + 2], 
                                               np.random.random(4) * (hi - lo) + lo, bounds = (lo, hi))
-        cur_loss = np.square(predict_backscatter(points[:, 1], *popt) - points[:, channel + 2])
+        cur_loss = np.mean(np.square(predict_backscatter(points[:, 1], *popt) - points[:, channel + 2]))
         if cur_loss < best_loss:
             best_loss = cur_loss
             best_coeffs = popt
@@ -158,7 +160,7 @@ def refine_attenuation_estimation(Ec, depths, channel, attempts = 10):
         popt, pcov = scipy.optimize.curve_fit(lambda Ec, a, b, c, d: predict_z(Ec, depths, a, b, c, d),
                                               Ec, depths, 
                                               np.random.random(4) * (hi - lo) + lo, bounds = (lo, hi))
-        cur_loss = np.square(predict_z(Ec, depths, *popt) - depths)
+        cur_loss = np.mean(np.square(predict_z(Ec, depths, *popt) - depths))
         if cur_loss < best_loss:
             best_loss = cur_loss
             best_coeffs = popt
@@ -281,8 +283,9 @@ if __name__ == '__main__':
         # Using given depth map
         print("Using user input depth map")
         original = read_image(args.original)
-        depths = read_depthmap(args.depth)
-        depths = normalize_depth_map(depths)
+        depths = read_depthmap(args.depth, original.size)
+
+        depths = normalize_depth_map(depths, 0.1, 10)
     else:
         # Predicting depth using monodepth2
         print("Predicting depth using monodepth2")
@@ -295,3 +298,7 @@ if __name__ == '__main__':
 
     Ja = Da * np.exp(att)
 
+    Js = wb_ycbcr_mean(Ja)
+
+    result = Image.fromarray(Js)
+    result.save("out/out.png")
