@@ -1,7 +1,23 @@
+# Python
+__pycache__/
+*.ipynb_checkpoints
+*.ipynb
+
+# Model
+*.pt
+
 # Data
 depthMaps/
 Raw/
 *.zip
+input/
+out/
+output/
+
+# CPP
+*.dylib
+*.so
+*.dll
 
 # System
 .DS_Store
