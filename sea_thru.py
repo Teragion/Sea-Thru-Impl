@@ -17,6 +17,7 @@
 
 import argparse
 import ctypes
+import json
 import sys
 
 import numpy as np
@@ -32,6 +33,7 @@ import cv2
 from PIL import Image
 import rawpy
 from skimage import exposure
+from skimage.restoration import denoise_bilateral
 import matplotlib
 
 from midas_helper import run_midas
@@ -99,6 +101,16 @@ def preprocess_predicted_depths(original, depths):
     ratio = far / np.max(depths)
     print("Estimated mean distance is {mean}".format(mean = np.mean(depths * ratio)))
     return depths * ratio
+
+def combine_map_predict(depths, predict):
+    idxs = np.where(depths == 0)
+    mfar = np.percentile(depths, 95)
+    far_idxs = np.where(depths > mfar)
+    pfar = np.min(predict[far_idxs])
+    ratio = mfar / pfar
+    depths[idxs] = predict[idxs] * ratio
+    depths = denoise_bilateral(depths)
+    return depths
 
 # Backscatter
 
@@ -172,58 +184,93 @@ def predict_z(x, a, b, c, d):
     Ec, depth = x
     return -np.log(Ec) / (a * np.exp(b * depth) + c * np.exp(d * depth))
 
-def estimate_wideband_attenuation(D, depths):
+def estimate_wideband_attenuation(D, depths, coarse_attempts = 5):
     """
     Args:
         Dc: direct signal
     """
-    # Ea = compute_illuminant_map_plugin(D, depths, p = 0.6, f = 2.0, eps = 0.03)
-    Ea = compute_illuminant_map_plugin(D, depths, p = 0.6, f = 2.0, eps = np.mean(depths) / 200.0)
-    Ea = np.clip(Ea, 0, None)
+    # Ea = compute_illuminant_map_plugin(D, depths, p = 0.5, f = 2.0, eps = 0.03)
+    Ea = compute_illuminant_map_plugin(D, depths, p = 0.4, f = 2.0, eps = np.mean(depths) / 50.0)
+    Ea = np.clip(Ea, 0, 1)
 
     att_channels = []
 
     for channel in range(3):
-        att_channels.append(refine_attenuation_estimation(Ea[:, :, channel], depths, channel))
+        Ec = np.copy(Ea[:, :, channel])
+        Ec.reshape(-1)
+        depths_flatten = np.copy(depths)
+        depths_flatten.reshape(-1)
+
+        locs = np.where(Ec > 1E-5)
+        Ec = Ec[locs]
+        depths_flatten = depths[locs]
+
+        # Coarse estimate
+        beta_D_hat = -np.log(Ec) / depths_flatten
+
+        lo = np.array([0, -10, 0, -10])
+        hi = np.array([100, 0, 100, 0])
+
+        b_lo = np.array([0, -np.inf, 0, -np.inf])
+        b_hi = np.array([np.inf, 0, np.inf, 0])
+
+
+        best_loss = np.inf
+        best_coeffs = []
+        for _ in range(coarse_attempts):
+            try:
+                popt, pcov = scipy.optimize.curve_fit(predict_wideband_attenuation,
+                                                    depths_flatten, beta_D_hat, 
+                                                    np.random.random(4) * (hi - lo) + lo, bounds = (b_lo, b_hi))
+                cur_loss = np.mean(np.square(predict_z((Ec, depths_flatten), *popt) - depths_flatten))
+                if cur_loss < best_loss:
+                    best_loss = cur_loss
+                    best_coeffs = popt
+            except RuntimeError as re:
+                print(re, file=sys.stderr)
+        
+        print("Coarse estimate gives coeffs for channel {channel} with mse {mse}".format(channel = channel, mse = best_loss))
+        print("a = {a}, b = {b}, c = {c}, d = {d}".format(
+            a = best_coeffs[0], b = best_coeffs[1], c = best_coeffs[2], d = best_coeffs[3]))
+
+        att_channels.append(refine_attenuation_estimation(Ea[:, :, channel], depths, channel, best_coeffs))
     
     att = np.stack(att_channels, axis = 2)
     
-    return att
+    return att, Ea
 
-def refine_attenuation_estimation(Ec, depths, channel, attempts = 5):
+def refine_attenuation_estimation(Ec, depths, channel, x0, attempts = 5):
     """
     Ec is illuminant map of only 1 channel
     """
     # Curve fitting
-    lo = np.array([-10, -10, -10, -10])
-    hi = np.array([100, 1, 100, 1])
+    lo = np.array([0, -10, 0, -10])
+    hi = np.array([100, 0, 100, 0])
+
+    b_lo = np.array([0, -np.inf, 0, -np.inf])
+    b_hi = np.array([np.inf, 0, np.inf, 0])
 
     best_loss = np.inf
     best_coeffs = []
 
     original_shape = depths.shape
-
-    # print(Ec)
-    # print(depths)
-
     Ec.reshape(-1)
     depths.reshape(-1)
 
-    locs = np.where(Ec > 1E-5)
+    locs = np.where((Ec > 1E-5) & (depths < np.percentile(depths, 95)) & (depths > np.percentile(depths, 10)))
     E = Ec[locs]
     z = depths[locs]
 
-    for _ in range(attempts):
-        try:
-            popt, pcov = scipy.optimize.curve_fit(predict_z,
-                                                (E, z), z, 
-                                                np.random.random(4) * (hi - lo) + lo, bounds = (lo, np.inf * np.ones(4)))
-            cur_loss = np.mean(np.square(predict_z((E, z), *popt) - z))
-            if cur_loss < best_loss:
-                best_loss = cur_loss
-                best_coeffs = popt
-        except RuntimeError as re:
-            print(re, file=sys.stderr)
+    try:
+        popt, pcov = scipy.optimize.curve_fit(predict_z,
+                                            (E, z), z, 
+                                            x0, bounds = (b_lo, b_hi))
+        cur_loss = np.mean(np.square(predict_z((E, z), *popt) - z))
+        if cur_loss < best_loss:
+            best_loss = cur_loss
+            best_coeffs = popt
+    except RuntimeError as re:
+        print(re, file=sys.stderr)
 
     print("Found coeffs for channel {channel} with mse {mse}".format(channel = channel, mse = best_loss))
     print("a = {a}, b = {b}, c = {c}, d = {d}".format(
@@ -234,7 +281,7 @@ def refine_attenuation_estimation(Ec, depths, channel, attempts = 5):
 
     return att_channel
 
-def compute_illuminant_map_plugin(D, depths, iterations = 100, p = 0.7, f = 2, eps = 0.2):
+def compute_illuminant_map_plugin(D, depths, iterations = 100, p = 0.5, f = 2, eps = 0.2):
     """
     Calls C interface for computing illuminant map and returns LSAC result
     """
@@ -338,7 +385,7 @@ def find_neighborhood(depths, x, y, epsilon):
 
     return ret
 
-def recover(Da, att):
+def recover(Da, att, depths):
     for c in range(3):
         att[:, :, c] = att[:, :, c] * depths
 
@@ -395,9 +442,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--original', required = True, help = "Path to original image")
     parser.add_argument('--depth', required = False, help = "Path to depth map")
-    parser.add_argument('--mode', required = True, help = "Mode = {{Map, Predict}}")
+    parser.add_argument('--mode', required = True, help = "Mode = {{Map, Predict, Hybrid}}")
     parser.add_argument('--hint', required = False, help = "Path to depth map as hint")
     parser.add_argument('--size', required = False, type = int, help = "Maximum side of image to shrink")
+    parser.add_argument('--prefix', required = False, help = "Prefix for output files")
 
     args = parser.parse_args()
 
@@ -406,18 +454,20 @@ if __name__ == '__main__':
     else:
         original = read_image(args.original)
 
+    prefix = (args.prefix if (args.prefix is not None) else "")
+
     if args.mode == "Map":
         # Using given depth map
         print("Using user input depth map")
         depths = read_depthmap(args.depth, (original.shape[1], original.shape[0]))
         depths = normalize_depth_map(depths, 0.1, 6.0)
-    else:
+    elif args.mode == "Predict":
         # Predicting depth using MiDaS
         print("Predicting depth using MiDaS")
         depths = run_midas(args.original, "out/", "weights/dpt_large-midas-2f21e586.pt", "dpt_large")
         # depths = run_midas(args.original, "out/", "weights/dpt_hybrid-midas-501f0c75.pt", "dpt_hybrid")
         depths = cv2.resize(depths, dsize = (original.shape[1], original.shape[0]), interpolation = cv2.INTER_CUBIC)
-        depths = np.square(depths) # More contrast!
+        # depths = np.square(depths) # More contrast!
         depths = np.max(depths) / depths # disparity map to depth map
         print(depths)
 
@@ -428,6 +478,15 @@ if __name__ == '__main__':
         else:
             print("Preprocessing monocular depths esimation without hint")    
             preprocess_predicted_depths(original, depths)
+    elif args.mode == "Hybrid":
+        print("Loading user input depth map")
+        depths = read_depthmap(args.depth, (original.shape[1], original.shape[0]))
+        print("Predicting depth using MiDaS")
+        pdepths = run_midas(args.original, "out/", "weights/dpt_large-midas-2f21e586.pt", "dpt_large")
+        pdepths = cv2.resize(pdepths, dsize = (original.shape[1], original.shape[0]), interpolation = cv2.INTER_CUBIC)
+        pdepths = np.max(pdepths) / pdepths # disparity map to depth map
+        print("Combining depth maps")
+        depths = combine_map_predict(depths, pdepths)
 
     print("Loaded image and depth map of size {x} x {y}".format(x = original.shape[0], y = original.shape[1]))
 
@@ -439,18 +498,24 @@ if __name__ == '__main__':
 
     D = np.uint8(Da * 255.0)
     backscatter_removed = Image.fromarray(D)
-    backscatter_removed.save("out/direct_signal.png")
+    backscatter_removed.save("out/" + prefix + "direct_signal.png")
 
     print("Estimating wideband attenuation...")
-    att = estimate_wideband_attenuation(Da, depths)
+    att, Ea = estimate_wideband_attenuation(Da, depths)
 
-    Ja = recover(Da, att / 2)
+    E = np.uint8(np.clip(Ea, 0, 1) * 255.0)
+    illuminant_map = Image.fromarray(E)
+    illuminant_map.save("out/" + prefix + "illuminant_map.png")
 
+    Ja = recover(Da, att, depths)
+
+    Ja = Ja / np.max(Ja)
     Ja = exposure.equalize_adapthist(Ja)
 
     Ja *= 255.0
+    # Js = np.uint8(Ja)
     Js = wb_ycbcr_mean(Ja)
 
     result = Image.fromarray(Js)
-    result.save("out/out.png")
+    result.save("out/" + prefix + "out.png")
     print("Finished.")
