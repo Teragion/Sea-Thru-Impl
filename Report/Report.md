@@ -8,7 +8,19 @@ Bibliographic Info: [10.1109/CVPR.2019.00178](https://doi.org/10.1109/CVPR.2019.
 
 It takes the original image and a depth map of the same size for inputs, and output the recovered image. 
 
-[MiDaS](https://github.com/isl-org/MiDaS) (by Intel Intelligent Systems Lab) is a project for predicting depth map from an arbitrary image.
+[MiDaS](https://github.com/isl-org/MiDaS) (by Intel Intelligent Systems Lab) is a project for predicting depth map from an arbitrary image. In this implementation, we explore the possibility of using monocular depth interpreting techniques to facilitate the recovery by Sea-thru.
+
+The authors did not provide any code accompanying the original paper, hence all of the implementation is done by myself. The images and depth maps are provided by the authors (see `Data/Data.md`).
+
+## Summary / Abstract
+This paper is a recent advancement of technologies reconstructing image from underwater captures as if they were taken on the ground (by "removing the water"). The major contribution of this paper is:
+1. Pointed out that coefficients related to wideband attenuation $\beta^D$ and backscatter $\beta^B$ are different.
+1. Proposed a practical way of independently estimating these parameters with experiment-based interpolating techniques. 
+1. Shown that both $\beta^D$ and $\beta^B$ are dominanted by their $z$ dependency.
+
+Traditionally, $\beta^D$ and $\beta^B$ are considered as equivalent parameters are results in significant distortion in some situations.
+
+Sea-thru greatly improved the results of recovering the image from underwater captures, for detailed comparison of results, please refer to the original paper (as I have not implemented the traditional methods to compare).
 
 ## Imaging Underwater
 Water's effects on an image taken underwater can be divided into two categories: **wideband attenuation** and **backscatter**. Specifically, underwater image $I$ is represented as 
@@ -28,7 +40,7 @@ where $\textbf{v}_D = \{z, \rho, E, S_c, \beta\}$ and $\textbf{v}_B = \{E, S_c, 
   <img src="img/4910.jpg" />
 </p>
 
-<figcaption align = "center">Example of image under water</figcaption>
+<p align = "center">Example of image under water</p>
 
 </figure>
 
@@ -41,19 +53,21 @@ It is, of course, desirable if we have all those parameters in mind, but this is
   <img src="img/IDB.png" />
 </p>
 
-<figcaption align = "center">Relationship between <i>image captured</i>, <i>direct signa</i> and <i>backscatter</i></figcaption>
+<p align = "center">Relationship between <i>image captured</i>, <i>direct signa</i> and <i>backscatter</i></p>
 
 </figure>
 
 The first step of image reconstruction is removing the $B_c$ for each color channel. This should be easy as $B_c$ does not at all depend on the color of the original image ($J_c$), but only the depth and the invariant water background.
 
 The backscatter is estimated using this formula
+
 $$
 \begin{align*}
 \hat{B_c}(\Omega) &\approx I_c(\Omega) \\
 \hat{B_c} &= B_c^\infty(1-e^{-\beta_c^Bz}) + J_c'e^{-\beta_c^{D\prime}z} 
 \end{align*}
 $$
+
 $J_c'$ and $\beta_c'$ are constant parameters replacing the real value in the original formula. $\Omega$ is a set of points that is chosen from the original image by the following procedure:
 
 1. Divide all pixels into $k$ bins evenly spaced by their depths values (in practice we have $k=10$).
@@ -67,7 +81,7 @@ We then simply use `scikit-learn`'s `curve_fit` routine to find optimal paramete
   <img src="img/4910_predict_direct_signal.png" />
 </p>
 
-<figcaption align = "center">The original image with backscatter removed</figcaption>
+<p align = "center">The original image with backscatter removed</p>
 
 </figure>
 
@@ -79,7 +93,7 @@ $$\beta_c^D(z) = a * e^{b\cdot z} + c * e^{d\cdot z}$$
 We use LSAC (Local Space Average Color) method to compute an illuminant map $\hat{E_c}$ for the original image.
 
 According to the original image, the colors should be computed as local averages of neighborhoods defined by 
-$$N_e(x,y) = \{(x',y')| \|z(x,y)\} - z(x',y')\leq \epsilon\|\}$$
+$$N_e(x,y) = \{(x',y')| \|z(x,y) - z(x',y')\|\leq \epsilon\}$$
 subject to that constraint that $(x',y')$ are four-connected.
 
 However, to compute the neighborhoods in this way, it would require computation cost and storage space of $O(n^2)$ where $n$ is the resolution of the image. This is prohibitively expensive for practical situations. 
@@ -92,7 +106,7 @@ Hence, instead of computing the neighborhood for each pixel, we segment the imag
   <img src="img/4910_predict_illuminant_map.png" />
 </p>
 
-<figcaption align = "center">The illuminant map computed for the original image</figcaption>
+<p align = "center">The illuminant map computed for the original image</p>
 
 </figure>
 
@@ -118,10 +132,10 @@ In our case, this interpolation is the most costly operation in the pipeline. Ho
   <img src="img/4910_map_out.png" />
 </p>
 
-<figcaption align = "center">Recovered image using given depth map</figcaption>
+<p align = "center">Recovered image using given depth map</p>
 
 </figure>
-This is the recovered image using Sea-thru for the example image and provided depth map. Note that the top/right parts of the image is distorted and barely recognizable. This is because the depth information at this area is missing. Although it is possible to use information from other area to interpolate, it does not yield good results. Indeed, in the original publication, the result image simply have those regions without depth information cropped out. 
+This is the recovered image using Sea-thru for the example image and provided depth map. Note that although the major part is reconstructed perfectly, the top/right parts of the image is distorted and barely recognizable. This is because the depth information at this area is missing. Although it is possible to use information from other area to interpolate, it does not yield good results. Indeed, in the original publication, the result image simply have those regions without depth information cropped out. 
 
 Naturally, we think of using predicted depth map from MiDaS to substitute or facilitate interpolation, and here is the results:
 
@@ -135,7 +149,7 @@ Naturally, we think of using predicted depth map from MiDaS to substitute or fac
   <img src="img/4910_hybrid_out.png" />
 </p>
 
-<figcaption align = "center">Recovered using predicted (top) depth map and interpolated (bottom)</figcaption>
+<p align = "center">Recovered using predicted (top) depth map and interpolated (bottom)</p>
 
 </figure>
 
@@ -155,7 +169,7 @@ There is still artifacts at the interpolated (probably due to my poor skill of s
   <img src="img/depths_Hybrid.png" />
 </p>
 
-<figcaption align = "center">Comparison of depth maps of each method</figcaption>
+<p align = "center">Comparison of depth maps of each method</p>
 
 </figure>
 
@@ -170,9 +184,8 @@ Nevertheless, all those methods provide acceptable results for image recovery, b
   <img src="img/grid.png" />
 </p>
 
-<figcaption align = "center">The recovery of some other images using hybrid method</figcaption>
+<p align = "center">The recovery of some other images using hybrid method</p>
 
 </figure>
 
-
-
+Clearly, these methods perform well even with images where depth varies greatly. All those images somewhat suffer from a blue-ish attenuation at the far side, but again that is due to the missing of direct depth data and conservative estimation by MiDaS. Future study may be oriented in dealing with those areas. 

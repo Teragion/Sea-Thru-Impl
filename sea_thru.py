@@ -184,6 +184,22 @@ def predict_z(x, a, b, c, d):
     Ec, depth = x
     return -np.log(Ec) / (a * np.exp(b * depth) + c * np.exp(d * depth))
 
+def find_reference_points_att(image, depths, channel, frac = 0.02):
+    z_max = np.max(depths)
+    z_min = np.min(depths)
+    z_bins = np.linspace(z_min, z_max, NUM_BINS + 1)
+    ret = []
+    for i in range(NUM_BINS):
+        lo, hi = z_bins[i], z_bins[i + 1]
+        indices = np.where(np.logical_and(depths >= lo, depths < hi))
+        if indices[0].size == 0:
+            continue
+        bin_z, bin_color = depths[indices], image[indices]
+        points_sorted = sorted(zip(bin_z, bin_color[:, channel]), key = lambda p : -p[1])
+        for j in range(math.ceil(len(points_sorted) * frac)):
+            ret.append(points_sorted[j])
+    return np.asarray(ret)
+
 def estimate_wideband_attenuation(D, depths, coarse_attempts = 5):
     """
     Args:
@@ -196,6 +212,9 @@ def estimate_wideband_attenuation(D, depths, coarse_attempts = 5):
     att_channels = []
 
     for channel in range(3):
+        # points = find_reference_points_att(Ea, depths, channel)
+        # depths_flatten = points[:, 0]
+        # Ec = points[:, 1]
         Ec = np.copy(Ea[:, :, channel])
         Ec.reshape(-1)
         depths_flatten = np.copy(depths)
@@ -203,7 +222,7 @@ def estimate_wideband_attenuation(D, depths, coarse_attempts = 5):
 
         locs = np.where(Ec > 1E-5)
         Ec = Ec[locs]
-        depths_flatten = depths[locs]
+        depths_flatten = depths_flatten[locs]
 
         # Coarse estimate
         beta_D_hat = -np.log(Ec) / depths_flatten
@@ -213,7 +232,6 @@ def estimate_wideband_attenuation(D, depths, coarse_attempts = 5):
 
         b_lo = np.array([0, -np.inf, 0, -np.inf])
         b_hi = np.array([np.inf, 0, np.inf, 0])
-
 
         best_loss = np.inf
         best_coeffs = []
@@ -233,7 +251,9 @@ def estimate_wideband_attenuation(D, depths, coarse_attempts = 5):
         print("a = {a}, b = {b}, c = {c}, d = {d}".format(
             a = best_coeffs[0], b = best_coeffs[1], c = best_coeffs[2], d = best_coeffs[3]))
 
-        att_channels.append(refine_attenuation_estimation(Ea[:, :, channel], depths, channel, best_coeffs))
+        coeffs = refine_attenuation_estimation(Ec, depths_flatten, channel, best_coeffs)
+        att_channel = predict_wideband_attenuation(depths, *coeffs)
+        att_channels.append(att_channel)
     
     att = np.stack(att_channels, axis = 2)
     
@@ -277,11 +297,10 @@ def refine_attenuation_estimation(Ec, depths, channel, x0, attempts = 5):
         a = best_coeffs[0], b = best_coeffs[1], c = best_coeffs[2], d = best_coeffs[3]))
 
     depths.reshape(original_shape)
-    att_channel = predict_wideband_attenuation(depths, *best_coeffs)
 
-    return att_channel
+    return best_coeffs
 
-def compute_illuminant_map_plugin(D, depths, iterations = 100, p = 0.5, f = 2, eps = 0.2):
+def compute_illuminant_map_plugin(D, depths, iterations = 500, p = 0.5, f = 2, eps = 0.2):
     """
     Calls C interface for computing illuminant map and returns LSAC result
     """
